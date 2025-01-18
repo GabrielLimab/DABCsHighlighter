@@ -1,6 +1,9 @@
 package com.example.plugin;
 
 import com.example.plugin.MethodGutterIconRenderer;
+import com.intellij.openapi.editor.Document;
+import com.intellij.openapi.editor.event.DocumentListener;
+import com.intellij.openapi.editor.event.DocumentEvent;
 import com.intellij.notification.NotificationGroupManager;
 import com.intellij.notification.NotificationType;
 import com.intellij.openapi.editor.Editor;
@@ -25,6 +28,7 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.Map;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.regex.Matcher;
@@ -34,12 +38,24 @@ import javax.swing.*;
 @Service
 public final class StringHighlighter implements EditorFactoryListener {
 
-    private final Set<String> allowedMethods;
-    private boolean notificationShown = false; // Ensure the toast is shown only once
+    private final Set<String> allowedMethods = new HashSet<>();
+    private final Map<String, String> libraryToCSV;
+    private final Set<String> ignoredWarnings = new HashSet<>(); // Track ignored warnings
 
     public StringHighlighter() {
-        String filePath = "C:\\Users\\gabri\\IdeaProjects\\demo\\DABCS-functions\\numpy-dabcs.csv";
-        this.allowedMethods = extractMethodNamesFromCSV(filePath);
+        libraryToCSV = Map.of(
+                "numpy", "C:\\Users\\gabri\\IdeaProjects\\demo\\DABCS-functions\\numpy-dabcs.csv",
+                "pandas", "C:\\Users\\gabri\\IdeaProjects\\demo\\DABCS-functions\\pandas-dabcs.csv",
+                "sklearn", "C:\\Users\\gabri\\IdeaProjects\\demo\\DABCS-functions\\sklearn-dabcs.csv"
+        );
+    }
+
+    private Set<String> extractMethodNamesFromMultipleCSVs(String[] filePaths) {
+        Set<String> methodNames = new HashSet<>();
+        for (String filePath : filePaths) {
+            methodNames.addAll(extractMethodNamesFromCSV(filePath));
+        }
+        return methodNames;
     }
 
     private Set<String> extractMethodNamesFromCSV(String filePath) {
@@ -73,15 +89,56 @@ public final class StringHighlighter implements EditorFactoryListener {
     @Override
     public void editorCreated(@NotNull EditorFactoryEvent event) {
         Editor editor = event.getEditor();
+        if (editor != null) {
+            attachDocumentListener(editor);
+            detectLibrariesAndLoadMethods(editor.getDocument());
+            highlightMethodCalls(editor, editor.getDocument().getText());
+        }
+    }
 
-        // Show the toast notification when the first editor is opened
-        if (!notificationShown) {
-//            showHighlightNotification();
-            notificationShown = true;
+    private void attachDocumentListener(Editor editor) {
+        Document document = editor.getDocument();
+        document.addDocumentListener(new DocumentListener() {
+            @Override
+            public void documentChanged(@NotNull DocumentEvent event) {
+                System.out.println("Document changed. Rechecking imports...");
+                detectLibrariesAndLoadMethods(document);
+                highlightMethodCalls(editor, document.getText());
+            }
+        });
+    }
+
+    private void detectLibrariesAndLoadMethods(Document document) {
+        Set<String> detectedLibraries = detectImportedLibraries(document);
+        allowedMethods.clear(); // Clear previously loaded methods
+
+        for (String library : detectedLibraries) {
+            String csvPath = libraryToCSV.get(library);
+            if (csvPath != null) {
+                allowedMethods.addAll(extractMethodNamesFromCSV(csvPath));
+                System.out.println("Loaded methods from: " + csvPath);
+            }
+        }
+    }
+
+    private Set<String> detectImportedLibraries(Document document) {
+        Set<String> detectedLibraries = new HashSet<>();
+        String[] lines = document.getText().split("\n");
+
+        for (String line : lines) {
+            if (line.startsWith("import ") || line.startsWith("from ")) {
+                if (line.contains("numpy")) {
+                    detectedLibraries.add("numpy");
+                } else if (line.contains("pandas")) {
+                    detectedLibraries.add("pandas");
+                } else if (line.contains("sklearn")) {
+                    detectedLibraries.add("sklearn");
+                }
+            }
         }
 
-        // Start the periodic task for highlighting
-        startHighlightingTask(editor);
+        System.out.println("Detected libraries: " + detectedLibraries);
+        return detectedLibraries;
     }
 
     @Override
@@ -139,15 +196,21 @@ public final class StringHighlighter implements EditorFactoryListener {
         Matcher matcher = pattern.matcher(documentText);
 
         MarkupModel markupModel = editor.getMarkupModel();
-        markupModel.removeAllHighlighters(); // Clear previous highlights
+        markupModel.removeAllHighlighters();
 
         while (matcher.find()) {
             String match = matcher.group();
             String methodName = match.substring(0, match.indexOf("(")).trim();
 
+            // Skip highlighting if the method is in the ignored warnings list
+            if (ignoredWarnings.contains(methodName)) {
+                System.out.println("Skipping highlighting for ignored method: " + methodName);
+                continue;
+            }
+
             if (allowedMethods.contains(methodName)) {
                 int start = matcher.start();
-                int end = matcher.end();
+                int end = matcher.end() - 1;
 
                 TextAttributes textAttributes = new TextAttributes();
                 textAttributes.setEffectType(EffectType.LINE_UNDERSCORE);
@@ -158,9 +221,14 @@ public final class StringHighlighter implements EditorFactoryListener {
                 );
 
                 highlighter.setErrorStripeTooltip("Method '" + methodName + "' is highlighted because it matches the CSV list.");
-                highlighter.setGutterIconRenderer(new MethodGutterIconRenderer(methodName));
+                highlighter.setGutterIconRenderer(new MethodGutterIconRenderer(methodName, editor, highlighter, this));
             }
         }
+    }
+
+    public void ignoreWarning(String methodName) {
+        ignoredWarnings.add(methodName);
+        System.out.println("Added method to ignored warnings: " + methodName);
     }
 
     private void showHighlightNotification() {
