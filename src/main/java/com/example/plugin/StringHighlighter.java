@@ -1,44 +1,33 @@
 package com.example.plugin;
 
-import com.example.plugin.MethodGutterIconRenderer;
 import com.intellij.openapi.editor.Document;
 import com.intellij.openapi.editor.event.DocumentListener;
 import com.intellij.openapi.editor.event.DocumentEvent;
-import com.intellij.notification.NotificationGroupManager;
-import com.intellij.notification.NotificationType;
 import com.intellij.openapi.editor.Editor;
-import com.intellij.openapi.editor.EditorFactory;
 import com.intellij.openapi.editor.event.EditorFactoryEvent;
 import com.intellij.openapi.editor.event.EditorFactoryListener;
 import com.intellij.openapi.editor.markup.*;
 import com.intellij.openapi.components.Service;
 import org.jetbrains.annotations.NotNull;
-import com.intellij.openapi.editor.event.EditorMouseMotionListener;
-import com.intellij.openapi.editor.event.EditorMouseEvent;
-import com.intellij.openapi.ui.popup.Balloon;
-import com.intellij.openapi.ui.popup.JBPopupFactory;
-import com.intellij.ui.JBColor;
-import com.intellij.ui.awt.RelativePoint;
-
 
 import java.awt.*;
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 import java.util.HashSet;
+import java.util.HashMap;
 import java.util.Set;
 import java.util.Map;
-import java.util.Timer;
-import java.util.TimerTask;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import javax.swing.*;
+
+import com.opencsv.CSVReader;
+import com.opencsv.exceptions.CsvValidationException;
 
 @Service
 public final class StringHighlighter implements EditorFactoryListener {
 
-    private final Set<String> allowedMethods = new HashSet<>();
+    private final Map<String, MethodMetadata> allowedMethods = new HashMap<>();
     private final Map<String, String> libraryToCSV;
     private final Set<String> ignoredWarnings = new HashSet<>(); // Track ignored warnings
 
@@ -50,41 +39,71 @@ public final class StringHighlighter implements EditorFactoryListener {
         );
     }
 
-    private Set<String> extractMethodNamesFromMultipleCSVs(String[] filePaths) {
-        Set<String> methodNames = new HashSet<>();
-        for (String filePath : filePaths) {
-            methodNames.addAll(extractMethodNamesFromCSV(filePath));
-        }
-        return methodNames;
-    }
-
-    private Set<String> extractMethodNamesFromCSV(String filePath) {
-        Set<String> methodNames = new HashSet<>();
+    private Map<String, MethodMetadata> extractMethodNamesFromCSV(String filePath) {
+        Map<String, MethodMetadata> methodMap = new HashMap<>();
         File file = new File(filePath);
 
         if (!file.exists()) {
             System.err.println("CSV file not found: " + filePath);
-            return methodNames;
+            return methodMap;
         }
 
-        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.contains("method: def")) {
-                    int start = line.indexOf("method: def") + 11;
-                    int end = line.indexOf("(", start);
-                    if (start > -1 && end > -1) {
-                        String methodName = line.substring(start, end).trim();
-                        methodNames.add(methodName);
+        try (CSVReader reader = new CSVReader(new FileReader(file))) {
+            String[] headers = reader.readNext(); // primeira linha
+            if (headers == null) return methodMap;
+
+            int fqnIndex = -1, versionIndex = -1;
+            for (int i = 0; i < headers.length; i++) {
+                String h = headers[i].trim().toLowerCase();
+                if (h.equals("fqn")) fqnIndex = i;
+                else if (h.equals("version")) versionIndex = i;
+            }
+
+            if (fqnIndex == -1 || versionIndex == -1) {
+                System.err.println("Erro: colunas 'fqn' e 'version' não encontradas.");
+                return methodMap;
+            }
+
+            String[] row;
+            while ((row = reader.readNext()) != null) {
+                if (row.length <= Math.max(fqnIndex, versionIndex)) continue;
+
+                String fqn = row[fqnIndex].trim();
+                String version = row[versionIndex].trim();
+
+                // Extrai o nome do método
+                String methodName = null;
+                if (fqn.contains("method: def")) {
+                    int start = fqn.indexOf("method: def") + "method: def".length();
+                    int end = fqn.indexOf("(", start);
+                    if (start >= 0 && end > start) {
+                        methodName = fqn.substring(start, end).trim();
                     }
                 }
+
+                // Extrai o nome do argumento
+                String param = null;
+                if (fqn.contains("param:")) {
+                    int start = fqn.indexOf("param:") + "param:".length();
+                    int end = fqn.indexOf(":", start);
+                    if (start >= 0 && end > start) {
+                        param = fqn.substring(start, end).trim();
+                    }
+                }
+
+                if (methodName != null && param != null && !version.isEmpty()) {
+                    methodMap.put(methodName, new MethodMetadata(param, version));
+                    System.out.println("Adicionado: " + methodName + " | param: " + param + " | version: " + version);
+                }
             }
-        } catch (IOException e) {
+        } catch (IOException | CsvValidationException e) {
             e.printStackTrace();
         }
 
-        return methodNames;
+        return methodMap;
     }
+
+
 
     @Override
     public void editorCreated(@NotNull EditorFactoryEvent event) {
@@ -92,7 +111,7 @@ public final class StringHighlighter implements EditorFactoryListener {
         if (editor != null) {
             attachDocumentListener(editor);
             detectLibrariesAndLoadMethods(editor.getDocument());
-            highlightMethodCalls(editor, editor.getDocument().getText());
+            highlightMethodCalls(editor);
         }
     }
 
@@ -103,7 +122,7 @@ public final class StringHighlighter implements EditorFactoryListener {
             public void documentChanged(@NotNull DocumentEvent event) {
                 System.out.println("Document changed. Rechecking imports...");
                 detectLibrariesAndLoadMethods(document);
-                highlightMethodCalls(editor, document.getText());
+                highlightMethodCalls(editor);
             }
         });
     }
@@ -115,7 +134,7 @@ public final class StringHighlighter implements EditorFactoryListener {
         for (String library : detectedLibraries) {
             String csvPath = libraryToCSV.get(library);
             if (csvPath != null) {
-                allowedMethods.addAll(extractMethodNamesFromCSV(csvPath));
+                allowedMethods.putAll(extractMethodNamesFromCSV(csvPath));
                 System.out.println("Loaded methods from: " + csvPath);
             }
         }
@@ -146,117 +165,80 @@ public final class StringHighlighter implements EditorFactoryListener {
         // Clean up resources if necessary
     }
 
-    private void startHighlightingTask(Editor editor) {
-        // Timer for periodic highlighting
-        Timer timer = new Timer(true); // Daemon timer
-        timer.scheduleAtFixedRate(new TimerTask() {
-            @Override
-            public void run() {
-                if (editor.isDisposed()) {
-                    timer.cancel(); // Stop the timer if the editor is closed
-                    return;
-                }
-
-                String documentText = editor.getDocument().getText();
-                highlightMethodCalls(editor, documentText); // Highlight methods dynamically
-            }
-        }, 0, 1000); // Run every second
-
-        // Mouse motion listener for hover-based tooltip display
-        EditorFactory.getInstance().getEventMulticaster().addEditorMouseMotionListener(new EditorMouseMotionListener() {
-            @Override
-            public void mouseMoved(@NotNull EditorMouseEvent e) {
-                Editor currentEditor = e.getEditor();
-                if (currentEditor != editor) return; // Ensure this listener is for the correct editor
-
-                int offset = currentEditor.getCaretModel().getOffset();
-                MarkupModel markupModel = currentEditor.getMarkupModel();
-
-                // Check if the mouse is over a highlighter
-                for (RangeHighlighter highlighter : markupModel.getAllHighlighters()) {
-                    if (highlighter.getStartOffset() <= offset && offset <= highlighter.getEndOffset()) {
-                        Object tooltip = highlighter.getErrorStripeTooltip();
-                        if (tooltip != null) {
-                            // IntelliJ handles tooltip display automatically via setErrorStripeTooltip.
-                            // You don't need to manually trigger anything here.
-                            break; // Exit after finding the first relevant highlighter
-                        }
-                    }
-                }
-            }
-        }, () -> {});
-    }
-
-
-
-
-
-    public void highlightMethodCalls(Editor editor, String documentText) {
-        Pattern pattern = Pattern.compile("\\b\\w+\\s*\\(");
-        Matcher matcher = pattern.matcher(documentText);
-
+    private void highlightMethodCalls(Editor editor) {
+        Document document = editor.getDocument();
         MarkupModel markupModel = editor.getMarkupModel();
         markupModel.removeAllHighlighters();
 
-        while (matcher.find()) {
-            String match = matcher.group();
-            String methodName = match.substring(0, match.indexOf("(")).trim();
+        String text = document.getText();
+        Pattern pattern = Pattern.compile("\\b(?:\\w+\\.)?(\\w+)\\s*\\("); // matches methodName(
+        Matcher matcher = pattern.matcher(text);
 
-            // Skip highlighting if the method is in the ignored warnings list
+        while (matcher.find()) {
+            String methodName = matcher.group(1);
+
+            if (!allowedMethods.containsKey(methodName)) continue;
+
             if (ignoredWarnings.contains(methodName)) {
-                System.out.println("Skipping highlighting for ignored method: " + methodName);
+                System.out.println("Ignorando manualmente: " + methodName);
                 continue;
             }
 
-            if (allowedMethods.contains(methodName)) {
-                int start = matcher.start();
-                int end = matcher.end() - 1;
+            MethodMetadata metadata = allowedMethods.get(methodName);
+            int startParen = matcher.end();
 
-                TextAttributes textAttributes = new TextAttributes();
-                textAttributes.setEffectType(EffectType.LINE_UNDERSCORE);
-                textAttributes.setEffectColor(Color.BLUE);
+            int endParen = findClosingParen(text, startParen - 1);
+            if (endParen == -1) continue;
 
-                RangeHighlighter highlighter = markupModel.addRangeHighlighter(
-                        start, end, HighlighterLayer.SELECTION, textAttributes, HighlighterTargetArea.EXACT_RANGE
-                );
+            String argsContent = text.substring(startParen, endParen);
 
-                highlighter.setErrorStripeTooltip("Method '" + methodName + "' is highlighted because it matches the CSV list.");
-                highlighter.setGutterIconRenderer(new MethodGutterIconRenderer(methodName, editor, highlighter, this));
+            if (argsContent.contains(metadata.param + " =") || argsContent.contains(metadata.param + "=")) {
+                System.out.println("Ignorando destaque para " + methodName + ": argumento '" + metadata.param + "' foi definido.");
+                continue;
             }
+
+            // Destaque
+            TextAttributes textAttributes = new TextAttributes();
+            textAttributes.setEffectType(EffectType.LINE_UNDERSCORE);
+            textAttributes.setEffectColor(Color.BLUE);
+
+            RangeHighlighter highlighter = markupModel.addRangeHighlighter(
+                    matcher.start(1),
+                    matcher.end(1),
+                    HighlighterLayer.SELECTION,
+                    textAttributes,
+                    HighlighterTargetArea.EXACT_RANGE
+            );
+
+            String tooltip = String.format(
+                    "Method '%s' may have breaking changes in argument '%s' since version %s.",
+                    methodName, metadata.param, metadata.version
+            );
+
+            highlighter.setErrorStripeTooltip(tooltip);
+            highlighter.setGutterIconRenderer(
+                    new MethodGutterIconRenderer(methodName, editor, highlighter, this, metadata)
+            );
         }
     }
+
 
     public void ignoreWarning(String methodName) {
         ignoredWarnings.add(methodName);
         System.out.println("Added method to ignored warnings: " + methodName);
     }
 
-    private void showHighlightNotification() {
-        NotificationGroupManager.getInstance()
-                .getNotificationGroup("Method Highlight Notification")
-                .createNotification(
-                        "Method Highlighter Active",
-                        "The plugin is actively highlighting methods defined in your CSV file.",
-                        NotificationType.INFORMATION
-                ).notify(null);
-    }
-
-    private void showToastNotification(String message) {
-        NotificationGroupManager.getInstance()
-                .getNotificationGroup("Method Highlight Notification")
-                .createNotification(
-                        "Hover Notification",
-                        message,
-                        NotificationType.INFORMATION
-                ).notify(null);
-    }
-
-    private void showBalloonTooltip(Editor editor, Point point, String message) {
-        JBPopupFactory.getInstance()
-                .createHtmlTextBalloonBuilder(message, null, JBColor.BLUE, JBColor.WHITE, null)
-                .setFadeoutTime(3000) // Balloon disappears after 3 seconds
-                .createBalloon()
-                .show(RelativePoint.fromScreen(point), Balloon.Position.above);
+    private int findClosingParen(String text, int openIndex) {
+        int depth = 0;
+        for (int i = openIndex; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '(') depth++;
+            else if (c == ')') {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+        return -1;
     }
 
 }
